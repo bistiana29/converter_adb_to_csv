@@ -1,24 +1,62 @@
 import streamlit as st
+import paramiko
+import pandas as pd
 import struct
 import datetime
 import re
-import pandas as pd
 import io
 
 # Konfigurasi Halaman
-st.set_page_config(page_title="ADB to CSV Converter", layout="wide", page_icon="⚙️")
+st.set_page_config(
+    page_title="ADB Extractor", 
+    layout="wide", 
+    initial_sidebar_state="expanded"
+)
 
-st.title("EdgeLink .adb to CSV Extractor & Filter")
-st.write("Unggah file log `.adb`, filter berdasarkan rentang waktu spesifik, dan unduh hasilnya dalam format CSV.")
+# CSS khusus untuk mencegah teks terpotong (...) pada chip multiselect
+st.markdown("""
+    <style>
+    div[data-baseweb="select"] span[data-baseweb="tag"] {
+        max-width: none !important;
+    }
+    div[data-baseweb="select"] span[data-baseweb="tag"] span {
+        white-space: normal !important;
+        word-break: break-all !important;
+    }
+    </style>
+""", unsafe_allow_html=True)
 
-# Fungsi parsing
-@st.cache_data
-def parse_adb(file_bytes):
-    data = file_bytes
-    
+# Inisialisasi Session State
+if 'remote_files' not in st.session_state:
+    st.session_state.remote_files = []
+if 'extracted_data' not in st.session_state:
+    st.session_state.extracted_data = pd.DataFrame()
+if 'ssh_client' not in st.session_state:
+    st.session_state.ssh_client = None
+
+# --- FUNGSI CORE: SSH & EKSTRAKSI ---
+def connect_and_search(ip, username, password, directory):
+    try:
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        
+        # Jika password kosong, gunakan None agar mencoba metode autentikasi lain jika ada
+        ssh.connect(hostname=ip, username=username, password=password if password else None, timeout=10)
+        
+        # Cari file .adb
+        stdin, stdout, stderr = ssh.exec_command(f'find {directory} -type f -name "*.adb"')
+        files = stdout.read().decode().splitlines()
+        
+        st.session_state.ssh_client = ssh
+        return files
+    except Exception as e:
+        st.error(f"Gagal terhubung atau mencari file: {e}")
+        return []
+
+def extract_adb_from_bytes(data):
     tags = [m.group().decode() for m in re.finditer(b'#[A-Z_0-9]{3,}', data)]
     if not tags:
-        return None, "Tidak ada tag yang ditemukan di dalam file."
+        return pd.DataFrame()
 
     anchor = None
     offset = 0
@@ -27,13 +65,10 @@ def parse_adb(file_bytes):
     GROUP_SIZE = num_tags * SLOT_SIZE
     MAX_TIME_GAP = 150 
 
+    # Cari Anchor
     while offset + GROUP_SIZE <= len(data):
         try:
-            group_ts = []
-            for i in range(num_tags):
-                ts = struct.unpack_from('<I', data, offset + (i * SLOT_SIZE))[0]
-                group_ts.append(ts)
-            
+            group_ts = [struct.unpack_from('<I', data, offset + (i * SLOT_SIZE))[0] for i in range(num_tags)]
             if max(group_ts) - min(group_ts) <= MAX_TIME_GAP:
                 dt = datetime.datetime.fromtimestamp(group_ts[0], datetime.timezone.utc)
                 if dt.year > 2000: 
@@ -44,19 +79,15 @@ def parse_adb(file_bytes):
         offset += 4
 
     if anchor is None:
-        return None, "Tidak dapat menemukan titik anchor yang valid."
+        return pd.DataFrame()
 
     rows = []
     offset = anchor
 
+    # Ekstrak Data
     while offset + GROUP_SIZE <= len(data):
         try:
-            group_ts = []
-            for i in range(num_tags):
-                slot = offset + (i * SLOT_SIZE)
-                ts = struct.unpack_from('<I', data, slot)[0]
-                group_ts.append(ts)
-
+            group_ts = [struct.unpack_from('<I', data, offset + (i * SLOT_SIZE))[0] for i in range(num_tags)]
             diff = max(group_ts) - min(group_ts)
             
             if diff <= MAX_TIME_GAP:
@@ -64,99 +95,149 @@ def parse_adb(file_bytes):
                 if dt_check.year > 2000:
                     for i, tag in enumerate(tags):
                         slot = offset + (i * SLOT_SIZE)
-                        ts = group_ts[i]
                         value = struct.unpack_from('<d', data, slot + 16)[0]
                         status = struct.unpack_from('<I', data, slot + 24)[0]
-                        dt = datetime.datetime.fromtimestamp(ts, datetime.timezone.utc)
+                        dt = datetime.datetime.fromtimestamp(group_ts[i], datetime.timezone.utc)
                         
-                        ts_str = dt.strftime('%Y-%m-%dT%H:%M:%SZ')
-                        rows.append([slot, ts_str, tag, round(value, 6), status])
-                    
+                        # Hanya format kolom yang direquest
+                        rows.append([slot, dt, tag, round(value, 6), status])
                     offset += GROUP_SIZE
                     continue 
             offset += 4
-
-        except:
+        except Exception:
             offset += 4
 
+    # DataFrame direvisi sesuai format yang diminta
     df = pd.DataFrame(rows, columns=["ID", "Timestamp", "TagName", "Value", "Quality"])
-    df['Timestamp'] = pd.to_datetime(df['Timestamp'])
+    return df
 
-    return df, f"Berhasil mengekstrak {len(df)} baris data dengan {len(tags)} tags: {', '.join(tags)}"
+# --- UI: SIDEBAR ---
+with st.sidebar:
+    st.markdown("### Koneksi Target")
+    ip_address = st.text_input("IP Address Target", "192.168.1.40")
+    username = st.text_input("Username", "root")
+    password = st.text_input("Password (Opsional)", type="password")
+    directory = st.text_input("Direktori Pencarian", "/")
+    
+    if st.button("Cari File", type="primary"):
+        with st.spinner("Mencari file di perangkat target..."):
+            files = connect_and_search(ip_address, username, password, directory)
+            if files:
+                st.session_state.remote_files = files
+                st.success(f"Ditemukan {len(files)} file .adb!")
+            else:
+                st.session_state.remote_files = []
+                st.warning("Tidak ada file .adb yang ditemukan.")
 
-# --- UI ---
-uploaded_file = st.file_uploader("Pilih file .adb", type=['adb'], accept_multiple_files=False, key="single_file_uploader")
+# --- UI: MAIN AREA ---
+st.title("ADB to CSV Converter")
+st.write("Ekstrak dan gabungkan log dari perangkat secara remote.")
 
-if uploaded_file is not None:
-    with st.spinner('Mengekstrak data biner...'):
-        file_bytes = uploaded_file.read()
-        df, message = parse_adb(file_bytes)
+# 2. Pilih File Ekstraksi
+st.markdown("### Pilih File Ekstraksi")
+st.info("💡 Anda bisa memilih lebih dari satu file. Data akan otomatis digabungkan.")
 
-    if df is not None and not df.empty:
-        st.success(message)
+selected_files = st.multiselect(
+    "Daftar file .adb di target:",
+    options=st.session_state.remote_files,
+    default=st.session_state.remote_files if len(st.session_state.remote_files) == 1 else []
+)
 
-        st.subheader("Filter Waktu (UTC)")
-
-        # ✅ FIX: definisikan min & max datetime
-        min_dt = df['Timestamp'].min()
-        max_dt = df['Timestamp'].max()
-
-        # dropdown options
-        hours = [f"{h:02d}" for h in range(24)]
-        minutes = [f"{m:02d}" for m in range(0, 60, 1)]
-
-        col1, col2 = st.columns(2)
-
-        with col1:
-            st.markdown("**Start Time**")
-            start_date = st.date_input("Start Date", min_dt.date())
-
-            c1, c2 = st.columns(2)
-            with c1:
-                start_hour = st.selectbox("Hour", hours, index=int(min_dt.strftime("%H")), key="start_hour")
-            with c2:
-                start_minute = st.selectbox("Min", minutes, index=int(min_dt.strftime("%M")), key="start_minute")
-
-        with col2:
-            st.markdown("**End Time**")
-            end_date = st.date_input("End Date", max_dt.date())
-
-            c3, c4 = st.columns(2)
-            with c3:
-                end_hour = st.selectbox("Hour", hours, index=int(max_dt.strftime("%H")), key="end_hour")
-            with c4:
-                end_minute = st.selectbox("Min", minutes, index=int(max_dt.strftime("%M")), key="end_minute")
-
-        # gabungkan datetime
-        user_start_dt = pd.to_datetime(f"{start_date} {start_hour}:{start_minute}").tz_localize('UTC')
-        user_end_dt = pd.to_datetime(f"{end_date} {end_hour}:{end_minute}").tz_localize('UTC')
-
-        # filter
-        mask = (df['Timestamp'] >= user_start_dt) & (df['Timestamp'] <= user_end_dt)
-        filtered_df = df.loc[mask].copy()
-
-        filtered_df = filtered_df.sort_values(by="Timestamp").reset_index(drop=True)
-
-        st.markdown(f"**Total Data Setelah Difilter: `{len(filtered_df)}` baris**")
-
-        filtered_df['Timestamp'] = filtered_df['Timestamp'].dt.strftime('%Y-%m-%dT%H:%M:%SZ')
-
-        st.dataframe(filtered_df.head(100), use_container_width=True)
-
-        if len(filtered_df) > 100:
-            st.caption(f"*Menampilkan 100 baris pertama dari total {len(filtered_df)} baris...*")
-
-        csv = filtered_df.to_csv(index=False).encode('utf-8')
-
-        download_filename = uploaded_file.name.replace('.adb', '_filtered.csv')
-
-        st.download_button(
-            label="⬇️ Download CSV",
-            data=csv,
-            file_name=download_filename,
-            mime="text/csv",
-            type="primary"
-        )
-
+if st.button("Preview"):
+    if not selected_files:
+        st.warning("Pilih minimal 1 file untuk diekstrak.")
+    elif not st.session_state.ssh_client:
+        st.error("Koneksi SSH terputus. Silakan cari file kembali.")
     else:
-        st.error("Data kosong atau gagal parsing.")
+        all_dfs = []
+        progress_bar = st.progress(0)
+        
+        try:
+            sftp = st.session_state.ssh_client.open_sftp()
+            
+            for i, file_path in enumerate(selected_files):
+                # Baca file dari remote ke memory
+                file_obj = io.BytesIO()
+                sftp.getfo(file_path, file_obj)
+                file_obj.seek(0)
+                file_bytes = file_obj.read()
+                
+                # Proses data
+                df = extract_adb_from_bytes(file_bytes)
+                if not df.empty:
+                    all_dfs.append(df)
+                
+                progress_bar.progress((i + 1) / len(selected_files))
+                
+            sftp.close()
+            
+            if all_dfs:
+                master_df = pd.concat(all_dfs, ignore_index=True)
+                master_df = master_df.sort_values('Timestamp').reset_index(drop=True)
+                st.session_state.extracted_data = master_df
+                st.success(f"✅ Berhasil menggabungkan {len(selected_files)} file dengan total {len(master_df)} baris data!")
+            else:
+                st.error("Gagal mengekstrak data. Format file mungkin tidak sesuai atau kosong.")
+                
+        except Exception as e:
+            st.error(f"Terjadi kesalahan saat ekstraksi: {e}")
+
+st.divider()
+
+# 3. Filter Waktu & Unduh
+st.markdown("### Filter Waktu (UTC) & Unduh")
+
+if not st.session_state.extracted_data.empty:
+    df = st.session_state.extracted_data.copy()
+    
+    min_time = df['Timestamp'].min().to_pydatetime()
+    max_time = df['Timestamp'].max().to_pydatetime()
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown("**Start Time**")
+        start_date = st.date_input("Start Date", min_time.date())
+        h1, m1 = st.columns(2)
+        with h1:
+            start_hour = st.selectbox("Hour", options=list(range(24)), index=min_time.hour, format_func=lambda x: f"{x:02d}", key="sh")
+        with m1:
+            start_min = st.selectbox("Min", options=list(range(60)), index=min_time.minute, format_func=lambda x: f"{x:02d}", key="sm")
+            
+    with col2:
+        st.markdown("**End Time**")
+        end_date = st.date_input("End Date", max_time.date())
+        h2, m2 = st.columns(2)
+        with h2:
+            end_hour = st.selectbox("Hour", options=list(range(24)), index=max_time.hour, format_func=lambda x: f"{x:02d}", key="eh")
+        with m2:
+            end_min = st.selectbox("Min", options=list(range(60)), index=max_time.minute, format_func=lambda x: f"{x:02d}", key="em")
+        
+    start_dt = pd.to_datetime(f"{start_date} {start_hour:02d}:{start_min:02d}:00")
+    end_dt = pd.to_datetime(f"{end_date} {end_hour:02d}:{end_min:02d}:59")
+    
+    if start_dt.tzinfo is None: start_dt = start_dt.tz_localize('UTC')
+    if end_dt.tzinfo is None: end_dt = end_dt.tz_localize('UTC')
+    df['Timestamp_tz'] = df['Timestamp'].dt.tz_localize('UTC') if df['Timestamp'].dt.tz is None else df['Timestamp']
+
+    # Filter Data
+    mask = (df['Timestamp_tz'] >= start_dt) & (df['Timestamp_tz'] <= end_dt)
+    filtered_df = df.loc[mask].drop(columns=['Timestamp_tz'])
+    
+    # Format string ISO 8601
+    filtered_df['Timestamp'] = filtered_df['Timestamp'].dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+    
+    st.markdown(f"**Total Data Setelah Difilter:** {len(filtered_df)} baris")
+    
+    st.dataframe(filtered_df, use_container_width=True, hide_index=True)
+    
+    csv = filtered_df.to_csv(index=False).encode('utf-8')
+    st.download_button(
+        label="📥 Download CSV",
+        data=csv,
+        file_name='exported_adb_data.csv',
+        mime='text/csv',
+        type="primary"
+    )
+else:
+    st.info("Lakukan ekstraksi file terlebih dahulu untuk melihat dan mengunduh data.")
