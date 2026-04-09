@@ -13,15 +13,23 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# CSS khusus untuk mencegah teks terpotong (...) pada chip multiselect
+# CSS
 st.markdown("""
     <style>
-    div[data-baseweb="select"] span[data-baseweb="tag"] {
-        max-width: none !important;
+    /* Mengatur tag multiselect agar tingginya menyesuaikan teks */
+    .stMultiSelect div[data-baseweb="select"] span[data-baseweb="tag"] {
+        max-width: 100% !important;
+        height: auto !important;
+        min-height: 2rem;
+        padding-top: 5px;
+        padding-bottom: 5px;
     }
-    div[data-baseweb="select"] span[data-baseweb="tag"] span {
+    /* Memaksa teks di dalam tag untuk turun ke baris baru (word-wrap) */
+    .stMultiSelect div[data-baseweb="select"] span[data-baseweb="tag"] span[title] {
         white-space: normal !important;
         word-break: break-all !important;
+        overflow: visible !important;
+        text-overflow: clip !important;
     }
     </style>
 """, unsafe_allow_html=True)
@@ -34,14 +42,19 @@ if 'extracted_data' not in st.session_state:
 if 'ssh_client' not in st.session_state:
     st.session_state.ssh_client = None
 
-# --- FUNGSI CORE: SSH & EKSTRAKSI ---
+# FUNGSI CORE: SSH & EKSTRAKSI
 def connect_and_search(ip, username, password, directory):
     try:
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        
-        # Jika password kosong, gunakan None agar mencoba metode autentikasi lain jika ada
-        ssh.connect(hostname=ip, username=username, password=password if password else None, timeout=10)
+        ssh.connect(
+            hostname=ip, 
+            username=username, 
+            password=password, 
+            timeout=10,
+            look_for_keys=False,
+            allow_agent=False
+        )
         
         # Cari file .adb
         stdin, stdout, stderr = ssh.exec_command(f'find {directory} -type f -name "*.adb"')
@@ -53,61 +66,107 @@ def connect_and_search(ip, username, password, directory):
         st.error(f"Gagal terhubung atau mencari file: {e}")
         return []
 
+def extract_tags(data):
+    # Batasi pencarian hanya pada 10.000 byte pertama (Area Header)
+    header_data = data[:10000] 
+    text = header_data.decode(errors='ignore')
+
+    tags = []
+    seen = set() # Sekarang seen akan menyimpan nama tag TANPA awalan '#'
+
+    hash_tags = re.findall(r'#[A-Za-z0-9_]{3,}', text)
+    normal_tags = re.findall(r'[A-Za-z0-9]+(?:[_:][A-Za-z0-9]+)+', text)
+
+    # Karena hash_tags digabungkan duluan, tag dengan '#' akan diproses lebih awal
+    for c in hash_tags + normal_tags:
+        if len(c) > 5:
+            # Hilangkan tanda '#' hanya untuk keperluan pengecekan duplikat
+            base_name = c.lstrip('#')
+            
+            # Jika nama dasarnya belum pernah dilihat, masukkan ke list
+            if base_name not in seen:
+                seen.add(base_name)
+                tags.append(c)
+
+    return tags
+
 def extract_adb_from_bytes(data):
-    tags = [m.group().decode() for m in re.finditer(b'#[A-Z_0-9]{3,}', data)]
+    tags = extract_tags(data)
     if not tags:
         return pd.DataFrame()
 
-    anchor = None
-    offset = 0
     num_tags = len(tags)
     SLOT_SIZE = 48
     GROUP_SIZE = num_tags * SLOT_SIZE
-    MAX_TIME_GAP = 150 
+    MAX_TIME_GAP = 600
 
-    # Cari Anchor
+    anchor = None
+    offset = 0
+
+    # 1. FIND ANCHOR (DINAMIS)
     while offset + GROUP_SIZE <= len(data):
         try:
-            group_ts = [struct.unpack_from('<I', data, offset + (i * SLOT_SIZE))[0] for i in range(num_tags)]
+            group_ts = []
+            for i in range(num_tags):
+                ts = struct.unpack_from('<I', data, offset + (i * SLOT_SIZE))[0]
+                group_ts.append(ts)
+            
+            # Cek apakah blok data sinkron (jarak waktu antar tag masuk akal)
             if max(group_ts) - min(group_ts) <= MAX_TIME_GAP:
                 dt = datetime.datetime.fromtimestamp(group_ts[0], datetime.timezone.utc)
-                if dt.year > 2000: 
+                if 2000 < dt.year < 2050: 
                     anchor = offset
+                    print(f"Anchor found at offset {anchor}, first timestamp: {dt}, total tags: {num_tags}")
                     break
         except:
             pass
         offset += 4
 
     if anchor is None:
+        print("Could not find anchor point!")
         return pd.DataFrame()
 
+    # 2. SEQUENCE EXTRACTION
     rows = []
     offset = anchor
 
-    # Ekstrak Data
     while offset + GROUP_SIZE <= len(data):
         try:
-            group_ts = [struct.unpack_from('<I', data, offset + (i * SLOT_SIZE))[0] for i in range(num_tags)]
+            group_ts = []
+            for i in range(num_tags):
+                slot = offset + (i * SLOT_SIZE)
+                ts = struct.unpack_from('<I', data, slot)[0]
+                group_ts.append(ts)
+
             diff = max(group_ts) - min(group_ts)
             
             if diff <= MAX_TIME_GAP:
                 dt_check = datetime.datetime.fromtimestamp(group_ts[0], datetime.timezone.utc)
-                if dt_check.year > 2000:
+                
+                if 2000 < dt_check.year < 2050:
                     for i, tag in enumerate(tags):
                         slot = offset + (i * SLOT_SIZE)
+                        ts = group_ts[i]
                         value = struct.unpack_from('<d', data, slot + 16)[0]
                         status = struct.unpack_from('<I', data, slot + 24)[0]
-                        dt = datetime.datetime.fromtimestamp(group_ts[i], datetime.timezone.utc)
                         
-                        # Hanya format kolom yang direquest
-                        rows.append([slot, dt, tag, round(value, 6), status])
+                        # Normalisasi Quality
+                        if status != 0:
+                            status = -1
+
+                        dt = datetime.datetime.fromtimestamp(ts, datetime.timezone.utc)
+                        ts_str = dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+                        
+                        rows.append([slot, ts_str, tag, round(value, 6), status])
+                    
                     offset += GROUP_SIZE
                     continue 
+
             offset += 4
+
         except Exception:
             offset += 4
 
-    # DataFrame direvisi sesuai format yang diminta
     df = pd.DataFrame(rows, columns=["ID", "Timestamp", "TagName", "Value", "Quality"])
     return df
 
@@ -174,8 +233,9 @@ if st.button("Preview"):
             if all_dfs:
                 master_df = pd.concat(all_dfs, ignore_index=True)
                 master_df = master_df.sort_values('Timestamp').reset_index(drop=True)
+                total_tag = master_df['TagName'].nunique()
                 st.session_state.extracted_data = master_df
-                st.success(f"✅ Berhasil menggabungkan {len(selected_files)} file dengan total {len(master_df)} baris data!")
+                st.success(f"✅ Berhasil menggabungkan {len(selected_files)} file dengan total {len(master_df)} baris data dan {total_tag} tag!")
             else:
                 st.error("Gagal mengekstrak data. Format file mungkin tidak sesuai atau kosong.")
                 
@@ -189,7 +249,7 @@ st.markdown("### Filter Waktu (UTC) & Unduh")
 
 if not st.session_state.extracted_data.empty:
     df = st.session_state.extracted_data.copy()
-    
+    df['Timestamp'] = pd.to_datetime(df['Timestamp'])
     min_time = df['Timestamp'].min().to_pydatetime()
     max_time = df['Timestamp'].max().to_pydatetime()
     
@@ -220,15 +280,33 @@ if not st.session_state.extracted_data.empty:
     if end_dt.tzinfo is None: end_dt = end_dt.tz_localize('UTC')
     df['Timestamp_tz'] = df['Timestamp'].dt.tz_localize('UTC') if df['Timestamp'].dt.tz is None else df['Timestamp']
 
-    # Filter Data
-    mask = (df['Timestamp_tz'] >= start_dt) & (df['Timestamp_tz'] <= end_dt)
-    filtered_df = df.loc[mask].drop(columns=['Timestamp_tz'])
+    st.divider()
+    st.markdown("**Filter TagName**")
+    unique_tags = df['TagName'].unique().tolist()
     
-    # Format string ISO 8601
+    num_cols = min(len(unique_tags), 5)
+    num_cols = max(1, num_cols)
+    
+    cols = st.columns(num_cols)
+    selected_tags = []
+    
+    for i, tag in enumerate(unique_tags):
+        col_index = i % num_cols
+        with cols[col_index]:
+            if st.checkbox(tag, value=True, key=f"tag_{tag}"):
+                selected_tags.append(tag)
+
+    # Filter Data (Perhatikan tambahan kondisi TagName di ujung mask)
+    mask = (
+        (df['Timestamp_tz'] >= start_dt) & 
+        (df['Timestamp_tz'] <= end_dt) & 
+        (df['TagName'].isin(selected_tags))
+    )
+    
+    filtered_df = df.loc[mask].drop(columns=['Timestamp_tz'])
     filtered_df['Timestamp'] = filtered_df['Timestamp'].dt.strftime('%Y-%m-%dT%H:%M:%SZ')
     
     st.markdown(f"**Total Data Setelah Difilter:** {len(filtered_df)} baris")
-    
     st.dataframe(filtered_df, use_container_width=True, hide_index=True)
     
     csv = filtered_df.to_csv(index=False).encode('utf-8')
