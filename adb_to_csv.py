@@ -173,7 +173,7 @@ def extract_adb_from_bytes(data):
 # --- UI: SIDEBAR ---
 with st.sidebar:
     st.markdown("### Koneksi Target")
-    ip_address = st.text_input("IP Address Target", "192.168.1.40")
+    ip_address = st.text_input("IP Address Target", "x.x.x.x")
     username = st.text_input("Username", "root")
     password = st.text_input("Password (Opsional)", type="password")
     directory = st.text_input("Direktori Pencarian", "/")
